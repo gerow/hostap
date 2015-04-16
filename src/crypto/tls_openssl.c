@@ -22,10 +22,13 @@
 #include <openssl/x509v3.h>
 #ifndef OPENSSL_NO_ENGINE
 #include <openssl/engine.h>
+#include <libp11.h>
 #endif /* OPENSSL_NO_ENGINE */
 
 #include "common.h"
+#include "common/defs.h"
 #include "crypto.h"
+#include "pkcs11.h"
 #include "sha1.h"
 #include "tls.h"
 
@@ -884,6 +887,14 @@ void tls_deinit(void *ssl_ctx)
 	}
 }
 
+#ifndef OPENSSL_NO_ENGINE
+static Boolean tls_is_pin_error(unsigned int err) {
+	return ERR_GET_LIB(err) == ERR_LIB_PKCS11 && (
+			ERR_GET_REASON(err) == CKR_PIN_INCORRECT ||
+			ERR_GET_REASON(err) == CKR_PIN_INVALID ||
+			ERR_GET_REASON(err) == CKR_PIN_LEN_RANGE);
+}
+#endif /* OPENSSL_NO_ENGINE */
 
 static int tls_engine_init(struct tls_connection *conn, const char *engine_id,
 			   const char *pin, const char *key_id,
@@ -936,11 +947,16 @@ static int tls_engine_init(struct tls_connection *conn, const char *engine_id,
 							    key_id, NULL,
 							    &key_cb);
 		if (!conn->private_key) {
+			unsigned long err = ERR_get_error();
 			wpa_printf(MSG_ERROR,
 				   "ENGINE: cannot load private key with id '%s' [%s]",
 				   key_id,
-				   ERR_error_string(ERR_get_error(), NULL));
-			ret = TLS_SET_PARAMS_ENGINE_PRV_INIT_FAILED;
+				   ERR_error_string(err, NULL));
+			if (tls_is_pin_error(err)) {
+				ret = TLS_SET_PARAMS_ENGINE_PRV_BAD_PIN;
+			} else {
+				ret = TLS_SET_PARAMS_ENGINE_PRV_INIT_FAILED;
+			}
 			goto err;
 		}
 	}
@@ -2184,9 +2200,13 @@ static int tls_engine_get_cert(struct tls_connection *conn,
 
 	if (!ENGINE_ctrl_cmd(conn->engine, "LOAD_CERT_CTRL",
 			     0, &params, NULL, 1)) {
+		unsigned long err = ERR_get_error();
 		wpa_printf(MSG_ERROR, "ENGINE: cannot load client cert with id"
 			   " '%s' [%s]", cert_id,
-			   ERR_error_string(ERR_get_error(), NULL));
+			   ERR_error_string(err, NULL));
+		if (tls_is_pin_error(err)) {
+			return TLS_SET_PARAMS_ENGINE_PRV_BAD_PIN;
+		}
 		return TLS_SET_PARAMS_ENGINE_PRV_INIT_FAILED;
 	}
 	if (!params.cert) {
